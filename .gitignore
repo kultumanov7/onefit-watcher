@@ -1,0 +1,5 @@
+__pycache__/
+watches.json
+.env
+node_modules/
+.wrangler/

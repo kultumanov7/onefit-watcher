@@ -1,18 +1,17 @@
 name = "onefit-watcher"
 main = "src/index.js"
-compatibility_date = "2025-06-01"
+compatibility_date = "2026-11-25"
+keep_vars = true
 
 [triggers]
 crons = ["*/5 * * * *"]   # «будильник» каждые 5 мин; реальная проверка раз в MIN..MAX минут со случайным сдвигом
 
 [vars]
-TG_CHAT_ID = "450721285"
 ONEFIT_BASE = ""          # заполнить после перехвата запроса 1Fit
-ONEFIT_FAKE = "1"         # поставить "0", когда 1Fit подключён
 MIN_MINUTES = "8"         # минимальный интервал между проверками
 MAX_MINUTES = "15"        # максимальный
 ACTIVE_HOURS = "7-24"     # проверять только с 7:00 до 24:00 по Астане
 
 [[kv_namespaces]]
 binding = "KV"
-id = "REPLACE_WITH_KV_ID"  # выдаст команда: npx wrangler kv namespace create KV
+id = "80387713d66e4248806a5c5bb5989bb0"  # выдаст команда: npx wrangler kv namespace create KV

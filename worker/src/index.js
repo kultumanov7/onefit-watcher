@@ -72,6 +72,24 @@ async function check(env, verbose = false) {
   if (changed) await save(env, w); // пишем в KV только при изменениях — укладываемся в бесплатный лимит
 }
 
+// Интервал между проверками: случайно от MIN_MINUTES до MAX_MINUTES (по умолчанию 8–15 мин),
+// плюс случайная задержка 0–60 с с точностью до миллисекунд. Ночью (вне ACTIVE_HOURS, по Астане) не проверяем.
+async function maybeCheck(env) {
+  const min = +(env.MIN_MINUTES || 8), max = +(env.MAX_MINUTES || 15);
+  const [from, to] = (env.ACTIVE_HOURS || "7-24").split("-").map(Number);
+  const hour = new Date(Date.now() + 5 * 3600e3).getUTCHours(); // Астана UTC+5
+  if (hour < from || hour >= to) return;
+
+  const next = +((await env.KV.get("next_check_at")) || 0);
+  if (Date.now() < next) return;
+
+  const interval = (min + Math.random() * (max - min)) * 60e3;
+  await env.KV.put("next_check_at", String(Date.now() + interval));
+
+  await new Promise((r) => setTimeout(r, Math.random() * 60e3)); // 0–60 с, разные миллисекунды
+  await check(env);
+}
+
 async function handle(env, text) {
   const [raw, ...a] = text.trim().split(/\s+/);
   const cmd = raw.split("@")[0].toLowerCase();
@@ -110,8 +128,8 @@ export default {
     if (String(m.chat?.id) === String(env.TG_CHAT_ID) && m.text?.startsWith("/")) await handle(env, m.text);
     return new Response("ok");
   },
-  // cron
+  // cron срабатывает каждые 5 минут, но реальная проверка — со случайным интервалом
   async scheduled(_ev, env, ctx) {
-    ctx.waitUntil(check(env));
+    ctx.waitUntil(maybeCheck(env));
   },
 };

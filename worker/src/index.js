@@ -97,7 +97,7 @@ async function searchGyms(env, q) {
 async function fetchSlots(env, gymId, date) {
   // -> [{id, start:'HH:MM', title, free}]
   if (env.ONEFIT_FAKE === "1")
-    return Math.random() < 0.3 ? [{ id: `${gymId}-${date}-19`, start: "19:00", title: "Термы", free: 3 }] : [];
+    return Math.random() < 0.3 ? [{ id: `${gymId}-${date}-19`, start: "19:00", title: "Термы", free: 3, state: "open" }] : [];
   if (!env.ONEFIT_TOKEN) throw new Error("нет токена 1Fit (секрет ONEFIT_TOKEN)");
   const r = await fetch("https://api.1fit.app/api/classes/v7/list/by-studio/", {
     method: "POST",
@@ -117,8 +117,13 @@ async function fetchSlots(env, gymId, date) {
       const count = s.available_places_context?.count ?? 0;
       const hidden = s.available_places_context?.needs_to_hide_count;
       const open = st === "AVAILABLE" || (!CLOSED.includes(st) && (count > 0 || hidden));
-      slots.push({ id: String(s.id), start: local.toISOString().slice(11, 16), title: c.name, free: open ? Math.max(count, 1) : 0, freeText: open ? (hidden ? "есть места" : `мест: ${count}`) : "" });
+      const state = open ? "open" : st === "PASSED" ? "passed" : "full";
+      slots.push({ id: String(s.id), start: local.toISOString().slice(11, 16), title: c.name, state,
+        free: open ? Math.max(count, 1) : 0,
+        freeText: open ? (hidden ? "есть места" : `мест: ${count}`) : (s.status?.reason || "нет мест") });
     }
+  // до какой даты 1Fit уже выложил расписание зала
+  slots.availableUntil = j.class_schedule_available_date ? iso(new Date(Date.parse(j.class_schedule_available_date) + 5 * 3600e3)) : null;
   return slots;
 }
 
@@ -157,15 +162,22 @@ async function check(env, verbose = false) {
       continue;
     }
     if (await env.KV.get("auth_warned")) await env.KV.delete("auth_warned");
-    const open = slots.filter((s) => s.free > 0 && inWindow(s.start, x.window));
+    const inWin = slots.filter((s) => inWindow(s.start, x.window));
+    const open = inWin.filter((s) => s.free > 0);
     const fresh = open.filter((s) => !x.seen.includes(s.id));
+    const line = (s) => `• ${s.start} ${s.title} — ${s.freeText}`;
+    const published = inWin.length > 0; // сеансы на этот день уже выложены
     if (fresh.length)
-      await send(env, `🔥 Открылась запись!\n${x.name || x.gym_id}, ${human(x.date)}\n` +
-        fresh.map((s) => `• ${s.start} ${s.title} — ${s.freeText || "мест: " + s.free}`).join("\n") + "\nБеги в 1Fit!");
-    else if (verbose)
-      await send(env, open.length
-        ? `${label(x)}: открыто сейчас —\n` + open.map((s) => `• ${s.start} ${s.title} — ${s.freeText || "мест: " + s.free}`).join("\n")
-        : `${label(x)}: свободных слотов пока нет`);
+      await send(env, `🔥 Открылась запись!\n${x.name || x.gym_id}, ${human(x.date)}\n` + fresh.map(line).join("\n") + "\nБеги в 1Fit!");
+    else if (published && !x.published && !open.length && !verbose) // один раз: расписание появилось, но мест нет
+      await send(env, `📅 Появилось расписание: ${label(x)}\n` + inWin.map(line).join("\n") + "\nМест пока нет — слежу дальше, напишу, если освободится.");
+    if (!fresh.length && verbose) {
+      if (open.length) await send(env, `✅ ${label(x)}: можно записаться —\n` + open.map(line).join("\n"));
+      else if (published) await send(env, `🚫 ${label(x)}: расписание есть, но мест нет —\n` + inWin.map(line).join("\n"));
+      else await send(env, `⏳ ${label(x)}: запись ещё не открылась` +
+        (slots.availableUntil ? ` (сейчас расписание выложено до ${human(slots.availableUntil)})` : "") + ". Слежу.");
+    }
+    if (published !== !!x.published) { x.published = published; changed = true; }
     const ids = open.map((s) => s.id);
     if (JSON.stringify(ids) !== JSON.stringify(x.seen)) { x.seen = ids; changed = true; }
   }

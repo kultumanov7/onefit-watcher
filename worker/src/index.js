@@ -249,9 +249,33 @@ async function handle(env, text) {
   if (w.some((x) => String(x.gym_id) === String(gym_id) && x.date === date && x.window === window))
     return send(env, `Уже слежу: ${name}, ${human(date)}. /list — все слежки`);
   const x = { gym_id: String(gym_id), name, date, window, seen: [] };
+
+  // Сначала смотрим, что там прямо сейчас
+  let slots = null, note = "";
+  try { slots = await fetchSlots(env, gym_id, date); }
+  catch (e) { note = e.auth ? "\n\n⚠️ Проверить сейчас не смог: токен 1Fit не работает." : `\n\n⚠️ Проверить сейчас не смог: ${e.message}`; }
+
+  const line = (s) => `• ${s.start} ${s.title} — ${s.freeText}`;
+  let status = "";
+  if (slots) {
+    const inWin = slots.filter((s) => inWindow(s.start, x.window));
+    const open = inWin.filter((s) => s.free > 0);
+    const upcoming = inWin.filter((s) => s.state !== "passed");
+    if (open.length)
+      return send(env, `✅ Уже можно записаться!\n${label(x)}\n` + open.map(line).join("\n") + "\n\nБеги в 1Fit. Слежку не включал — если всё займут, напиши ещё раз.");
+    if (inWin.length && !upcoming.length)
+      return send(env, `${label(x)}: все сеансы на этот день уже прошли. Слежку не включал.`);
+    if (inWin.length) {
+      status = "🚫 Расписание есть, но мест нет:\n" + inWin.map(line).join("\n") + "\nНапишу, если место освободится.";
+      x.published = true;
+    } else {
+      status = "⏳ Запись на этот день ещё не открылась" +
+        (slots.availableUntil ? ` (сейчас расписание выложено до ${human(slots.availableUntil)})` : "") + ".\nНапишу, как только откроется.";
+    }
+  }
   w.push(x);
   await save(env, w);
-  return send(env, `🔔 Уведомления включены!\n${label(x)}\n\nКак только появится свободный слот — сразу напишу.\n/list — все слежки, /stop — выключить`);
+  return send(env, `🔔 Слежка включена: ${label(x)}\n\n${status || "Как только появится свободный слот — сразу напишу."}${note}\n\n/list — все слежки, /stop — выключить`);
 }
 
 export default {

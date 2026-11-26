@@ -128,54 +128,67 @@ async function fetchSlots(env, gymId, date) {
 }
 
 // ---------- Telegram ----------
-const send = (env, text) =>
+const send = (env, text, chat = env.TG_CHAT_ID) =>
   fetch(`https://api.telegram.org/bot${env.TG_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: env.TG_CHAT_ID, text }),
+    body: JSON.stringify({ chat_id: chat, text }),
   });
 
 // ---------- состояние в KV ----------
+// watches: [{chat, gym_id, name, date, window, seen, published}]
+// users:   {chatId: "имя"} — кому владелец (TG_CHAT_ID) разрешил пользоваться ботом
 const load = async (env) => JSON.parse((await env.KV.get("watches")) || "[]");
 const save = (env, w) => env.KV.put("watches", JSON.stringify(w));
+const loadUsers = async (env) => JSON.parse((await env.KV.get("users")) || "{}");
+const saveUsers = (env, u) => env.KV.put("users", JSON.stringify(u));
+const owner = (env) => String(env.TG_CHAT_ID);
+const chatOf = (env, x) => String(x.chat || owner(env)); // старые слежки без chat — владельца
 
 const inWindow = (start, win) => !win || (start >= win.split("-")[0] && start <= win.split("-")[1]);
+const line = (s) => `• ${s.start} ${s.title} — ${s.freeText}`;
 
-async function check(env, verbose = false) {
+// onlyChat: для /now — проверить и ответить только по слежкам этого человека
+async function check(env, verbose = false, onlyChat = null) {
   const w = await load(env);
   const today = new Date(Date.now() + 5 * 3600e3).toISOString().slice(0, 10); // Астана UTC+5
+  const cache = new Map(); // один запрос в 1Fit на зал+день, даже если следят двое
   let changed = false;
   for (const x of [...w]) {
     if (x.date < today) { w.splice(w.indexOf(x), 1); changed = true; continue; }
+    const chat = chatOf(env, x);
+    if (onlyChat && chat !== onlyChat) continue;
+    const key = `${x.gym_id}|${x.date}`;
     let slots;
-    try { slots = await fetchSlots(env, x.gym_id, x.date); }
-    catch (e) {
-      if (e.auth) { // предупреждаем один раз, а не каждую проверку
+    try {
+      if (!cache.has(key)) cache.set(key, fetchSlots(env, x.gym_id, x.date));
+      slots = await cache.get(key);
+    } catch (e) {
+      if (e.auth) { // предупреждаем владельца один раз, а не каждую проверку
         if (!(await env.KV.get("auth_warned"))) {
           await env.KV.put("auth_warned", "1");
           await send(env, "⚠️ Токен 1Fit больше не работает — обнови ONEFIT_TOKEN в Cloudflare. Слежки сохранены.");
         }
-        else if (verbose) await send(env, "⚠️ Токен 1Fit не работает — обнови ONEFIT_TOKEN в Cloudflare.");
+        if (verbose) await send(env, "⚠️ Сейчас не получается проверить 1Fit (токен не работает). Слежки сохранены.", onlyChat || owner(env));
         return;
       }
-      if (verbose) await send(env, `⚠️ ${label(x)}: ${e.message}`);
+      if (verbose) await send(env, `⚠️ ${label(x)}: ${e.message}`, chat);
       continue;
     }
     if (await env.KV.get("auth_warned")) await env.KV.delete("auth_warned");
     const inWin = slots.filter((s) => inWindow(s.start, x.window));
     const open = inWin.filter((s) => s.free > 0);
     const fresh = open.filter((s) => !x.seen.includes(s.id));
-    const line = (s) => `• ${s.start} ${s.title} — ${s.freeText}`;
     const published = inWin.length > 0; // сеансы на этот день уже выложены
     if (fresh.length)
-      await send(env, `🔥 Открылась запись!\n${x.name || x.gym_id}, ${human(x.date)}\n` + fresh.map(line).join("\n") + "\nБеги в 1Fit!");
+      await send(env, `🔥 Открылась запись!\n${x.name || x.gym_id}, ${human(x.date)}\n` + fresh.map(line).join("\n") + "\nБеги в 1Fit!", chat);
     else if (published && !x.published && !open.length && !verbose) // один раз: расписание появилось, но мест нет
-      await send(env, `📅 Появилось расписание: ${label(x)}\n` + inWin.map(line).join("\n") + "\nМест пока нет — слежу дальше, напишу, если освободится.");
+      await send(env, `📅 Появилось расписание: ${label(x)}\n` + inWin.map(line).join("\n") + "\nМест пока нет — слежу дальше, напишу, если освободится.", chat);
     if (!fresh.length && verbose) {
-      if (open.length) await send(env, `✅ ${label(x)}: можно записаться —\n` + open.map(line).join("\n"));
-      else if (published) await send(env, `🚫 ${label(x)}: расписание есть, но мест нет —\n` + inWin.map(line).join("\n"));
+      if (open.length) await send(env, `✅ ${label(x)}: можно записаться —\n` + open.map(line).join("\n"), chat);
+      else if (published) await send(env, `🚫 ${label(x)}: расписание есть, но мест нет —\n` + inWin.map(line).join("\n"), chat);
       else await send(env, `⏳ ${label(x)}: запись ещё не открылась` +
-        (slots.availableUntil ? ` (сейчас расписание выложено до ${human(slots.availableUntil)})` : "") + ". Слежу.");
+        (slots.availableUntil ? ` (сейчас расписание выложено до ${human(slots.availableUntil)})` : "") + ". Слежу.", chat);
     }
     if (published !== !!x.published) { x.published = published; changed = true; }
     const ids = open.map((s) => s.id);
@@ -205,67 +218,89 @@ async function maybeCheck(env) {
 
 const label = (x) => `${x.name || x.gym_id}, ${human(x.date)}, ${x.window || "любое время"}`;
 
-async function handle(env, text) {
+const OWNER_HELP = `\n\nДоступ (только для тебя):\n/users — кому разрешено\n/allow <id> — дать доступ\n/deny <id> — забрать доступ`;
+
+async function handle(env, text, chat) {
   text = text.trim();
-  const w = await load(env);
+  const isOwner = chat === owner(env);
+  const all = await load(env);
+  const w = all.filter((x) => chatOf(env, x) === chat); // слежки этого человека
+  const reply = (t) => send(env, t, chat);
+  const saveMine = (mine) => save(env, [...all.filter((x) => chatOf(env, x) !== chat), ...mine]);
 
   if (text.startsWith("/")) {
     const [raw, ...a] = text.split(/\s+/);
     const cmd = raw.split("@")[0].toLowerCase();
-    if (cmd === "/start" || cmd === "/help") return send(env, HELP);
+    if (cmd === "/start" || cmd === "/help") return reply(HELP + (isOwner ? OWNER_HELP : ""));
     if (cmd === "/list")
-      return send(env, w.length ? "Слежу за:\n" + w.map((x, i) => `${i + 1}. ${label(x)}`).join("\n") : "Пока ни за чем не слежу. Напиши, например: Therma, пятница");
+      return reply(w.length ? "Слежу за:\n" + w.map((x, i) => `${i + 1}. ${label(x)}`).join("\n") : "Пока ни за чем не слежу. Напиши, например: Therma, пятница");
     if (cmd === "/stop" || cmd === "/rm") {
-      if (!a.length) { await save(env, []); return send(env, "🔕 Все уведомления выключены."); }
+      if (!a.length) { await saveMine([]); return reply("🔕 Все уведомления выключены."); }
       const i = +a[0];
-      if (!(i >= 1 && i <= w.length)) return send(env, "Нет такого номера. Посмотри /list");
+      if (!(i >= 1 && i <= w.length)) return reply("Нет такого номера. Посмотри /list");
       const [x] = w.splice(i - 1, 1);
-      await save(env, w);
-      return send(env, `🔕 Выключил: ${label(x)}`);
+      await saveMine(w);
+      return reply(`🔕 Выключил: ${label(x)}`);
     }
     if (cmd === "/now") {
-      if (!w.length) return send(env, "Пока ни за чем не слежу.");
-      await send(env, "Проверяю…");
-      return check(env, true);
+      if (!w.length) return reply("Пока ни за чем не слежу.");
+      await reply("Проверяю…");
+      return check(env, true, chat);
     }
-    return send(env, "Не знаю такую команду. /start — подсказка");
+    if (isOwner && (cmd === "/allow" || cmd === "/deny" || cmd === "/users")) {
+      const users = await loadUsers(env);
+      if (cmd === "/users")
+        return reply(Object.keys(users).length ? "Доступ есть у:\n" + Object.entries(users).map(([id, n]) => `${n} — ${id}  (/deny ${id})`).join("\n") : "Пока только у тебя.");
+      const id = a[0];
+      if (!/^-?\d+$/.test(id || "")) return reply(`Формат: ${cmd} <id>`);
+      if (cmd === "/allow") {
+        users[id] = (await env.KV.get(`pending:${id}`)) || id;
+        await saveUsers(env, users);
+        await send(env, "✅ Тебе открыли доступ! Напиши /start — расскажу, как пользоваться.", id);
+        return reply(`✅ Доступ выдан: ${users[id]}`);
+      }
+      delete users[id];
+      await saveUsers(env, users);
+      await save(env, all.filter((x) => chatOf(env, x) !== id)); // убираем и его слежки
+      return reply(`🚫 Доступ забран у ${id}`);
+    }
+    return reply("Не знаю такую команду. /start — подсказка");
   }
 
   // "Therma, пятница, 18-22"
   const parts = text.split(",").map((s) => s.trim()).filter(Boolean);
-  if (parts.length < 2) return send(env, "Напиши через запятую зал и день, например:\nTherma, пятница\n\n/start — подсказка");
+  if (parts.length < 2) return reply("Напиши через запятую зал и день, например:\nTherma, пятница\n\n/start — подсказка");
   const gyms = findGym(parts[0]);
-  if (!gyms.length) return send(env, `Не нашёл зал «${parts[0]}» в 1Fit Астаны. Попробуй написать название иначе.`);
+  if (!gyms.length) return reply(`Не нашёл зал «${parts[0]}» в 1Fit Астаны. Попробуй написать название иначе.`);
   if (gyms.length > 1)
-    return send(env, `Нашёл несколько, уточни (можно написать номер вместо названия):\n` +
+    return reply(`Нашёл несколько, уточни (можно написать номер вместо названия):\n` +
       gyms.slice(0, 10).map(([id, n]) => `${id} — ${n}`).join("\n"));
   const date = parseDay(parts[1]);
-  if (!date) return send(env, `Не понял день «${parts[1]}». Примеры: сегодня, завтра, пятница, 5 декабря, 05.12`);
+  if (!date) return reply(`Не понял день «${parts[1]}». Примеры: сегодня, завтра, пятница, 5 декабря, 05.12`);
   let window = null;
   if (parts[2]) {
     window = parseWindow(parts[2]);
-    if (!window) return send(env, `Не понял время «${parts[2]}». Пример: 18-22 или 18:30-21:00`);
+    if (!window) return reply(`Не понял время «${parts[2]}». Пример: 18-22 или 18:30-21:00`);
   }
   const [gym_id, name] = gyms[0];
   if (w.some((x) => String(x.gym_id) === String(gym_id) && x.date === date && x.window === window))
-    return send(env, `Уже слежу: ${name}, ${human(date)}. /list — все слежки`);
-  const x = { gym_id: String(gym_id), name, date, window, seen: [] };
+    return reply(`Уже слежу: ${name}, ${human(date)}. /list — все слежки`);
+  const x = { chat, gym_id: String(gym_id), name, date, window, seen: [] };
 
   // Сначала смотрим, что там прямо сейчас
   let slots = null, note = "";
   try { slots = await fetchSlots(env, gym_id, date); }
-  catch (e) { note = e.auth ? "\n\n⚠️ Проверить сейчас не смог: токен 1Fit не работает." : `\n\n⚠️ Проверить сейчас не смог: ${e.message}`; }
+  catch (e) { note = e.auth ? "\n\n⚠️ Проверить сейчас не смог: 1Fit не пускает (токен)." : `\n\n⚠️ Проверить сейчас не смог: ${e.message}`; }
 
-  const line = (s) => `• ${s.start} ${s.title} — ${s.freeText}`;
   let status = "";
   if (slots) {
     const inWin = slots.filter((s) => inWindow(s.start, x.window));
     const open = inWin.filter((s) => s.free > 0);
     const upcoming = inWin.filter((s) => s.state !== "passed");
     if (open.length)
-      return send(env, `✅ Уже можно записаться!\n${label(x)}\n` + open.map(line).join("\n") + "\n\nБеги в 1Fit. Слежку не включал — если всё займут, напиши ещё раз.");
+      return reply(`✅ Уже можно записаться!\n${label(x)}\n` + open.map(line).join("\n") + "\n\nБеги в 1Fit. Слежку не включал — если всё займут, напиши ещё раз.");
     if (inWin.length && !upcoming.length)
-      return send(env, `${label(x)}: все сеансы на этот день уже прошли. Слежку не включал.`);
+      return reply(`${label(x)}: все сеансы на этот день уже прошли. Слежку не включал.`);
     if (inWin.length) {
       status = "🚫 Расписание есть, но мест нет:\n" + inWin.map(line).join("\n") + "\nНапишу, если место освободится.";
       x.published = true;
@@ -274,9 +309,8 @@ async function handle(env, text) {
         (slots.availableUntil ? ` (сейчас расписание выложено до ${human(slots.availableUntil)})` : "") + ".\nНапишу, как только откроется.";
     }
   }
-  w.push(x);
-  await save(env, w);
-  return send(env, `🔔 Слежка включена: ${label(x)}\n\n${status || "Как только появится свободный слот — сразу напишу."}${note}\n\n/list — все слежки, /stop — выключить`);
+  await save(env, [...all, x]);
+  return reply(`🔔 Слежка включена: ${label(x)}\n\n${status || "Как только появится свободный слот — сразу напишу."}${note}\n\n/list — все слежки, /stop — выключить`);
 }
 
 export default {
@@ -286,7 +320,20 @@ export default {
     if (req.headers.get("x-telegram-bot-api-secret-token") !== env.WEBHOOK_SECRET) return new Response("no", { status: 403 });
     const u = await req.json();
     const m = u.message || {};
-    if (String(m.chat?.id) === String(env.TG_CHAT_ID) && m.text) await handle(env, m.text);
+    if (!m.text || m.chat?.type !== "private") return new Response("ok");
+    const chat = String(m.chat.id);
+    const users = await loadUsers(env);
+    if (chat === owner(env) || users[chat]) {
+      await handle(env, m.text, chat);
+    } else {
+      // незнакомец: просим владельца разрешить (не чаще раза в сутки на человека)
+      const who = [m.from?.first_name, m.from?.last_name].filter(Boolean).join(" ") + (m.from?.username ? ` (@${m.from.username})` : "");
+      if (!(await env.KV.get(`pending:${chat}`))) {
+        await env.KV.put(`pending:${chat}`, who || chat, { expirationTtl: 86400 });
+        await send(env, `👋 ${who || "Кто-то"} хочет пользоваться ботом.\nРазрешить: /allow ${chat}`);
+      }
+      await send(env, "Привет! Этот бот приватный. Я отправил запрос владельцу — как только он разрешит, я напишу.", chat);
+    }
     return new Response("ok");
   },
   // cron срабатывает каждые 5 минут, но реальная проверка — со случайным интервалом

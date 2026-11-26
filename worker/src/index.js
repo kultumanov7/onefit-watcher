@@ -98,10 +98,28 @@ async function fetchSlots(env, gymId, date) {
   // -> [{id, start:'HH:MM', title, free}]
   if (env.ONEFIT_FAKE === "1")
     return Math.random() < 0.3 ? [{ id: `${gymId}-${date}-19`, start: "19:00", title: "Термы", free: 3 }] : [];
-  // TODO: реальный эндпоинт из перехваченного запроса
-  // const j = await oneFit(env, `/<path>/${gymId}/schedule`, { date });
-  // return j.data.map(s => ({ id: String(s.id), start: s.start_time.slice(11, 16), title: s.name, free: s.capacity - s.booked }));
-  throw new Error("fetchSlots ещё не подключён к 1Fit");
+  if (!env.ONEFIT_TOKEN) throw new Error("нет токена 1Fit (секрет ONEFIT_TOKEN)");
+  const r = await fetch("https://api.1fit.app/api/classes/v7/list/by-studio/", {
+    method: "POST",
+    headers: { "Auth-Token": env.ONEFIT_TOKEN, "Content-Type": "application/json", "Accept-Language": "ru" },
+    body: JSON.stringify({ studio_id: +gymId, start_date: `${date}T00:00:00+05:00` }),
+  });
+  if (r.status === 401 || r.status === 403) throw Object.assign(new Error("токен 1Fit больше не работает"), { auth: true });
+  if (!r.ok) throw new Error(`1Fit ответил ${r.status}`);
+  const j = await r.json();
+  const CLOSED = ["PASSED", "NOT_AVAILABLE", "CANCELED", "CANCELLED", "FINISHED"];
+  const slots = [];
+  for (const c of j.result || [])
+    for (const s of c.class_schedules || []) {
+      const local = new Date(Date.parse(s.start_date) + 5 * 3600e3); // Астана
+      if (iso(local) !== date) continue;
+      const st = s.status?.status || "";
+      const count = s.available_places_context?.count ?? 0;
+      const hidden = s.available_places_context?.needs_to_hide_count;
+      const open = st === "AVAILABLE" || (!CLOSED.includes(st) && (count > 0 || hidden));
+      slots.push({ id: String(s.id), start: local.toISOString().slice(11, 16), title: c.name, free: open ? Math.max(count, 1) : 0, freeText: open ? (hidden ? "есть места" : `мест: ${count}`) : "" });
+    }
+  return slots;
 }
 
 // ---------- Telegram ----------
@@ -126,13 +144,28 @@ async function check(env, verbose = false) {
     if (x.date < today) { w.splice(w.indexOf(x), 1); changed = true; continue; }
     let slots;
     try { slots = await fetchSlots(env, x.gym_id, x.date); }
-    catch (e) { if (verbose) await send(env, `⚠️ ${label(x)}: ${e.message}`); continue; }
+    catch (e) {
+      if (e.auth) { // предупреждаем один раз, а не каждую проверку
+        if (!(await env.KV.get("auth_warned"))) {
+          await env.KV.put("auth_warned", "1");
+          await send(env, "⚠️ Токен 1Fit больше не работает — обнови ONEFIT_TOKEN в Cloudflare. Слежки сохранены.");
+        }
+        else if (verbose) await send(env, "⚠️ Токен 1Fit не работает — обнови ONEFIT_TOKEN в Cloudflare.");
+        return;
+      }
+      if (verbose) await send(env, `⚠️ ${label(x)}: ${e.message}`);
+      continue;
+    }
+    if (await env.KV.get("auth_warned")) await env.KV.delete("auth_warned");
     const open = slots.filter((s) => s.free > 0 && inWindow(s.start, x.window));
     const fresh = open.filter((s) => !x.seen.includes(s.id));
     if (fresh.length)
       await send(env, `🔥 Открылась запись!\n${x.name || x.gym_id}, ${human(x.date)}\n` +
-        fresh.map((s) => `• ${s.start} ${s.title} — мест: ${s.free}`).join("\n") + "\nБеги в 1Fit!");
-    else if (verbose) await send(env, `${label(x)}: свободных слотов пока нет`);
+        fresh.map((s) => `• ${s.start} ${s.title} — ${s.freeText || "мест: " + s.free}`).join("\n") + "\nБеги в 1Fit!");
+    else if (verbose)
+      await send(env, open.length
+        ? `${label(x)}: открыто сейчас —\n` + open.map((s) => `• ${s.start} ${s.title} — ${s.freeText || "мест: " + s.free}`).join("\n")
+        : `${label(x)}: свободных слотов пока нет`);
     const ids = open.map((s) => s.id);
     if (JSON.stringify(ids) !== JSON.stringify(x.seen)) { x.seen = ids; changed = true; }
   }

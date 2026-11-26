@@ -185,12 +185,13 @@ async function check(env, verbose = false) {
 }
 
 // Интервал между проверками: случайно от MIN_MINUTES до MAX_MINUTES (по умолчанию 8–15 мин),
-// плюс случайная задержка 0–60 с с точностью до миллисекунд. Ночью (вне ACTIVE_HOURS, по Астане) не проверяем.
+// плюс случайная задержка 0–60 с с точностью до миллисекунд. Вне ACTIVE_HOURS (по Астане) не проверяем; "7-2" = с 7:00 до 2:00.
 async function maybeCheck(env) {
   const min = +(env.MIN_MINUTES || 8), max = +(env.MAX_MINUTES || 15);
   const [from, to] = (env.ACTIVE_HOURS || "7-24").split("-").map(Number);
   const hour = new Date(Date.now() + 5 * 3600e3).getUTCHours(); // Астана UTC+5
-  if (hour < from || hour >= to) return;
+  const active = from <= to ? hour >= from && hour < to : hour >= from || hour < to; // "7-2" = с 7:00 до 2:00 ночи
+  if (!active) return;
 
   const next = +((await env.KV.get("next_check_at")) || 0);
   if (Date.now() < next) return;
